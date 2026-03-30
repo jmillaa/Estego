@@ -24,8 +24,10 @@ except ImportError:
 
 MODEL_NAME = "gpt-4.1-mini"
 MAX_GENERATION_ATTEMPTS = 5
-MAX_SENTENCE_ATTEMPTS = 7
+MAX_SENTENCE_ATTEMPTS = 12
 COHERENCE_CONTEXT_SIZE = 3
+SENTENCE_TEMPERATURE = 0.2
+REPAIR_TEMPERATURE = 0.0
 
 SPANISH_ALPHABET = [
     "A",
@@ -286,6 +288,8 @@ Actúa como redactor humano cuidadoso con el conteo exacto de palabras.
 - No uses listas, numeraciones, títulos ni explicaciones.
 - No menciones esteganografía, códigos ni instrucciones.
 - Evita dos puntos y punto y coma.
+- Usa palabras separadas por espacios simples (sin guiones).
+- Termina con un único punto final.
 - Contexto previo: {context_text}
 {special_rule}{correction_block}
 4. Formato de salida
@@ -300,6 +304,61 @@ Actúa como redactor humano cuidadoso con el conteo exacto de palabras.
 
 Intento actual para esta frase: {attempt}
 """
+
+
+def build_sentence_repair_prompt(
+    topic: str,
+    target_words: int,
+    sentence_index: int,
+    total_sentences: int,
+    candidate_sentence: str,
+    previous_sentences: Sequence[str],
+    attempt: int,
+) -> str:
+    context_block = " ".join(previous_sentences).strip()
+    context_text = context_block if context_block else "(sin contexto previo)"
+    return f"""1. Objetivo de la tarea
+Reescribe una frase para que tenga exactamente {target_words} palabras.
+La frase corresponde a la posición {sentence_index} de {total_sentences} en un texto sobre "{topic}".
+
+2. Rol asignado al modelo
+Actúa como corrector de estilo y conteo exacto en español.
+
+3. Detalles estrictos
+- Debes conservar el sentido principal de la frase candidata.
+- Debe quedar natural y coherente con el contexto previo.
+- Debe ser exactamente una frase.
+- Debe tener exactamente {target_words} palabras.
+- No uses listas, numeraciones, títulos ni explicaciones.
+- Evita guiones y evita dos puntos.
+- Termina con un único punto final.
+- Contexto previo: {context_text}
+- Frase candidata: "{candidate_sentence}"
+
+4. Formato de salida
+- Devuelve solo la frase corregida.
+- Sin texto adicional.
+
+5. Instrucción de autocorrección o iteración
+- Cuenta palabras antes de responder.
+- Si no son {target_words}, vuelve a ajustar.
+
+Intento de reparación: {attempt}
+"""
+
+
+def choose_best_sentence_candidate(text: str, target_words: int) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return ""
+
+    sentences = split_sentences(normalized)
+    if not sentences:
+        return normalized
+
+    # Si el modelo devuelve más de una frase, elegimos la más cercana al conteo objetivo.
+    best = min(sentences, key=lambda s: (abs(count_words(s) - target_words), len(s)))
+    return best.strip()
 
 
 def normalize_candidate_sentence(raw_text: str) -> str:
@@ -318,6 +377,71 @@ def normalize_candidate_sentence(raw_text: str) -> str:
         text += "."
 
     return text
+
+
+def request_text_from_openai(
+    client: OpenAI,
+    model: str,
+    prompt: str,
+    temperature: float,
+    max_output_tokens: int,
+) -> str:
+    response = client.responses.create(
+        model=model,
+        input=prompt,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+    )
+    return extract_response_text(response)
+
+
+def try_repair_sentence(
+    client: OpenAI,
+    model: str,
+    topic: str,
+    target_words: int,
+    sentence_index: int,
+    total_sentences: int,
+    candidate_sentence: str,
+    previous_sentences: Sequence[str],
+    max_repair_attempts: int = 3,
+) -> tuple[str | None, str]:
+    last_error = "Sin detalles."
+    for attempt in range(1, max_repair_attempts + 1):
+        prompt = build_sentence_repair_prompt(
+            topic=topic,
+            target_words=target_words,
+            sentence_index=sentence_index,
+            total_sentences=total_sentences,
+            candidate_sentence=candidate_sentence,
+            previous_sentences=previous_sentences,
+            attempt=attempt,
+        )
+        try:
+            raw = request_text_from_openai(
+                client=client,
+                model=model,
+                prompt=prompt,
+                temperature=REPAIR_TEMPERATURE,
+                max_output_tokens=max(32, target_words * 5),
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"Error de API en reparación: {exc}"
+            continue
+
+        if not raw:
+            last_error = "Respuesta vacía en reparación."
+            continue
+
+        best = choose_best_sentence_candidate(raw, target_words)
+        repaired = normalize_candidate_sentence(best if best else raw)
+        words = count_words(repaired)
+        if words == target_words:
+            return repaired, ""
+
+        last_error = f"Reparación con conteo incorrecto: esperado {target_words}, obtenido {words}."
+
+    return None, last_error
 
 
 def generate_single_sentence(
@@ -344,17 +468,23 @@ def generate_single_sentence(
         )
 
         try:
-            response = client.responses.create(model=model, input=prompt)
+            generated_text = request_text_from_openai(
+                client=client,
+                model=model,
+                prompt=prompt,
+                temperature=SENTENCE_TEMPERATURE,
+                max_output_tokens=max(32, target_words * 5),
+            )
         except Exception as exc:  # noqa: BLE001
             last_error = f"Error de API: {exc}"
             continue
 
-        generated_text = extract_response_text(response)
         if not generated_text:
             last_error = "Respuesta vacía del modelo."
             continue
 
-        candidate = normalize_candidate_sentence(generated_text)
+        best_candidate = choose_best_sentence_candidate(generated_text, target_words)
+        candidate = normalize_candidate_sentence(best_candidate if best_candidate else generated_text)
         sentence_parts = split_sentences(candidate)
         if len(sentence_parts) != 1:
             last_error = f"Se esperaba una sola frase y se detectaron {len(sentence_parts)}."
@@ -362,7 +492,22 @@ def generate_single_sentence(
 
         words = count_words(sentence_parts[0])
         if words != target_words:
-            last_error = f"Conteo incorrecto: esperado {target_words}, obtenido {words}."
+            repaired, repair_error = try_repair_sentence(
+                client=client,
+                model=model,
+                topic=topic,
+                target_words=target_words,
+                sentence_index=sentence_index,
+                total_sentences=total_sentences,
+                candidate_sentence=sentence_parts[0],
+                previous_sentences=previous_sentences,
+            )
+            if repaired is not None:
+                return repaired, ""
+            last_error = (
+                f"Conteo incorrecto: esperado {target_words}, obtenido {words}. "
+                f"{repair_error}"
+            )
             continue
 
         return sentence_parts[0], ""
@@ -376,39 +521,45 @@ def extract_response_text(response: Any) -> str:
         return output_text.strip()
 
     output = getattr(response, "output", None)
+    if not isinstance(output, list):
+        return ""
+
+    def get_field(obj: Any, field: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(field)
+        return getattr(obj, field, None)
+
+    assistant_messages: list[Any] = []
+    for item in output:
+        if get_field(item, "type") == "message" and get_field(item, "role") == "assistant":
+            assistant_messages.append(item)
+
+    if not assistant_messages:
+        return ""
+
+    final_phase_messages = [m for m in assistant_messages if get_field(m, "phase") == "final_answer"]
+    target_message = final_phase_messages[-1] if final_phase_messages else assistant_messages[-1]
+
+    content = get_field(target_message, "content")
+    if not isinstance(content, list):
+        return ""
+
     chunks: list[str] = []
+    for part in content:
+        if get_field(part, "type") != "output_text":
+            continue
 
-    if isinstance(output, list):
-        for item in output:
-            content = getattr(item, "content", None)
-            if content is None and isinstance(item, dict):
-                content = item.get("content")
+        maybe_text = get_field(part, "text")
+        text_value: str | None = None
+        if isinstance(maybe_text, str):
+            text_value = maybe_text
+        elif isinstance(maybe_text, dict):
+            maybe_value = maybe_text.get("value")
+            if isinstance(maybe_value, str):
+                text_value = maybe_value
 
-            if not isinstance(content, list):
-                continue
-
-            for part in content:
-                text_value: str | None = None
-
-                if isinstance(part, dict):
-                    maybe_text = part.get("text")
-                    if isinstance(maybe_text, str):
-                        text_value = maybe_text
-                    elif isinstance(maybe_text, dict):
-                        maybe_value = maybe_text.get("value")
-                        if isinstance(maybe_value, str):
-                            text_value = maybe_value
-                else:
-                    maybe_text_attr = getattr(part, "text", None)
-                    if isinstance(maybe_text_attr, str):
-                        text_value = maybe_text_attr
-                    elif maybe_text_attr is not None:
-                        maybe_value_attr = getattr(maybe_text_attr, "value", None)
-                        if isinstance(maybe_value_attr, str):
-                            text_value = maybe_value_attr
-
-                if text_value and text_value.strip():
-                    chunks.append(text_value.strip())
+        if text_value and text_value.strip():
+            chunks.append(text_value.strip())
 
     return "\n".join(chunks).strip()
 
@@ -510,7 +661,7 @@ def save_result_file(
 
 def read_multiline_input(prompt: str) -> str:
     print(prompt)
-    print("Pega el texto. Escribe una línea que contenga solo FIN para terminar.")
+    print("Pega el texto. Escribe FIN para terminar o deja una línea vacía para finalizar.")
     lines: list[str] = []
 
     while True:
@@ -524,9 +675,41 @@ def read_multiline_input(prompt: str) -> str:
 
         if line.strip().upper() == "FIN":
             break
+        if line.strip() == "" and lines:
+            break
         lines.append(line)
 
     return "\n".join(lines).strip()
+
+
+def read_text_from_file() -> str:
+    try:
+        path_raw = input("Ruta del archivo .txt: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nOperación cancelada.")
+        return ""
+
+    if not path_raw:
+        print("Ruta vacía.")
+        return ""
+
+    cleaned_path = path_raw.strip().strip('"').strip("'")
+    path = Path(cleaned_path)
+    if not path.exists() or not path.is_file():
+        print("No se encontró el archivo indicado.")
+        return ""
+
+    try:
+        raw_content = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        print(f"No se pudo leer el archivo: {exc}")
+        return ""
+
+    marker = "Texto portador generado:"
+    if marker in raw_content:
+        return raw_content.split(marker, 1)[1].strip()
+
+    return raw_content
 
 
 def ask_yes_no(prompt: str) -> bool:
@@ -649,7 +832,21 @@ def handle_generate_option() -> None:
 
 
 def handle_extract_option() -> None:
-    carrier_text = read_multiline_input("\nIntroduce el texto portador multilínea.")
+    print("\nSelecciona origen del texto portador:")
+    print("1. Pegar texto manualmente")
+    print("2. Cargar desde archivo .txt")
+
+    try:
+        source = input("Opción (1-2): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nOperación cancelada.")
+        return
+
+    if source == "2":
+        carrier_text = read_text_from_file()
+    else:
+        carrier_text = read_multiline_input("\nIntroduce el texto portador multilínea.")
+
     if not carrier_text:
         print("No se recibió texto para extraer.")
         return
