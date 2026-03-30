@@ -1,0 +1,13 @@
+# Ignorar archivos de entorno y configuraciones sensibles
+.env
+# Otros archivos y carpetas comunes a ignorar
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env.*
+# VSCode
+.vscode/
+# Archivos de sistema
+.DS_Store
+Thumbs.db
